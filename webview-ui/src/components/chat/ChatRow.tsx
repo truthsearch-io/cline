@@ -13,6 +13,7 @@ import McpResponseDisplay from "@/components/mcp/chat-display/McpResponseDisplay
 import McpResourceRow from "@/components/mcp/configuration/tabs/installed/server-row/McpResourceRow"
 import McpToolRow from "@/components/mcp/configuration/tabs/installed/server-row/McpToolRow"
 import { useExtensionState } from "@/context/ExtensionStateContext"
+import { shouldUseMarkdownForReasoning } from "../../utils/reasoning"
 import { FileServiceClient, TaskServiceClient } from "@/services/grpc-client"
 import { findMatchingResourceOrTemplate, getMcpServerDisplayName } from "@/utils/mcp"
 import { vscode } from "@/utils/vscode"
@@ -237,7 +238,10 @@ export const ChatRowContent = ({
 	sendMessageFromChatRow,
 	onSetQuote,
 }: ChatRowContentProps) => {
-	const { mcpServers, mcpMarketplaceCatalog } = useExtensionState()
+	const { mcpServers, mcpMarketplaceCatalog, apiConfiguration } = useExtensionState()
+
+	// Extract model info for reasoning markdown detection
+	const apiModelId = apiConfiguration?.apiModelId
 	const [seeNewChangesDisabled, setSeeNewChangesDisabled] = useState(false)
 	const [quoteButtonState, setQuoteButtonState] = useState<QuoteButtonState>({
 		visible: false,
@@ -1075,6 +1079,8 @@ export const ChatRowContent = ({
 						</WithCopyButton>
 					)
 				case "reasoning":
+					const useMarkdown = shouldUseMarkdownForReasoning(apiModelId || "")
+
 					return (
 						<>
 							{message.text && (
@@ -1101,7 +1107,13 @@ export const ChatRowContent = ({
 													}}
 												/>
 											</span>
-											<span className="ph-no-capture">{message.text}</span>
+											<div className="ph-no-capture">
+												{useMarkdown ? (
+													<Markdown markdown={message.text} />
+												) : (
+													<span style={{ whiteSpace: "pre-wrap" }}>{message.text}</span>
+												)}
+											</div>
 										</div>
 									) : (
 										<div style={{ display: "flex", alignItems: "center" }}>
