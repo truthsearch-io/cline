@@ -1615,7 +1615,14 @@ export class Task {
 		const supportsBrowserUse = modelSupportsBrowserUse && !disableBrowserTool // only enable browser use if the model supports it and the user hasn't disabled it
 
 		const isClaude4ModelFamily = await this.isClaude4ModelFamily()
-		let systemPrompt = await SYSTEM_PROMPT(cwd, supportsBrowserUse, this.mcpHub, this.browserSettings, isClaude4ModelFamily)
+		let systemPrompt = await SYSTEM_PROMPT(
+			cwd,
+			supportsBrowserUse,
+			this.mcpHub,
+			this.browserSettings,
+			isClaude4ModelFamily,
+			this.chatSettings.mode,
+		)
 
 		let settingsCustomInstructions = this.customInstructions?.trim()
 		await this.migratePreferredLanguageToolSetting()
@@ -1991,6 +1998,60 @@ export class Task {
 				break
 			}
 			case "tool_use":
+				const pushToolResult = (content: ToolResponse, isClaude4ModelFamily: boolean = false) => {
+					if (typeof content === "string") {
+						const resultText = content || "(tool did not return anything)"
+
+						if (isClaude4ModelFamily) {
+							// Claude 4 family: Use function_results format
+							this.userMessageContent.push({
+								type: "text",
+								text: `<function_results>\n${resultText}\n</function_results>`,
+							})
+						} else {
+							// Non-Claude 4: Use traditional format with header
+							this.userMessageContent.push({
+								type: "text",
+								text: `${toolDescription()} Result:`,
+							})
+							this.userMessageContent.push({
+								type: "text",
+								text: resultText,
+							})
+						}
+					} else {
+						this.userMessageContent.push(...content)
+					}
+					// once a tool result has been collected, ignore all other tool uses since we should only ever present one tool result per message
+					this.didAlreadyUseTool = true
+				}
+
+				// The user can approve, reject, or provide feedback (rejection). However the user may also send a message along with an approval, in which case we add a separate user message with this feedback.
+				// Runtime validation: Prevent execution tools in Plan mode
+				if (this.chatSettings.mode === "plan") {
+					const executionTools = [
+						"execute_command",
+						"write_to_file",
+						"replace_in_file",
+						"new_rule",
+						"browser_action",
+						"attempt_completion",
+					]
+
+					if (executionTools.includes(block.name)) {
+						await this.say(
+							"error",
+							`Tool ${block.name} is not available in Plan mode. Please switch to Act mode to execute tools, or use plan_mode_respond to continue planning.`,
+						)
+						pushToolResult(
+							formatResponse.toolError(
+								`Tool ${block.name} is not available in Plan mode. Only information gathering and planning tools are allowed in Plan mode.`,
+							),
+						)
+						break
+					}
+				}
+
 				const toolDescription = () => {
 					switch (block.name) {
 						case "execute_command":
@@ -2062,35 +2123,6 @@ export class Task {
 					break
 				}
 
-				const pushToolResult = (content: ToolResponse, isClaude4ModelFamily: boolean = false) => {
-					if (typeof content === "string") {
-						const resultText = content || "(tool did not return anything)"
-
-						if (isClaude4ModelFamily) {
-							// Claude 4 family: Use function_results format
-							this.userMessageContent.push({
-								type: "text",
-								text: `<function_results>\n${resultText}\n</function_results>`,
-							})
-						} else {
-							// Non-Claude 4: Use traditional format with header
-							this.userMessageContent.push({
-								type: "text",
-								text: `${toolDescription()} Result:`,
-							})
-							this.userMessageContent.push({
-								type: "text",
-								text: resultText,
-							})
-						}
-					} else {
-						this.userMessageContent.push(...content)
-					}
-					// once a tool result has been collected, ignore all other tool uses since we should only ever present one tool result per message
-					this.didAlreadyUseTool = true
-				}
-
-				// The user can approve, reject, or provide feedback (rejection). However the user may also send a message along with an approval, in which case we add a separate user message with this feedback.
 				const pushAdditionalToolFeedback = (feedback?: string, images?: string[], fileContentString?: string) => {
 					if (!feedback && (!images || images.length === 0) && !fileContentString) {
 						return
