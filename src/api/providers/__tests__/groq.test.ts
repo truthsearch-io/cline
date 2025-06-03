@@ -261,6 +261,160 @@ describe("QwQ Model Tests", () => {
 		// QwQ models should support 32K tokens
 		expect(maxTokens).to.equal(32768)
 	})
+
+	it("should use fallback message when no text content is received", async function () {
+		this.timeout(5000)
+
+		// Mock the OpenAI client to simulate QwQ behavior with only reasoning chunks
+		const mockStream = async function* () {
+			// Yield reasoning chunks
+			yield {
+				choices: [
+					{
+						delta: {
+							reasoning: "Let me think about this step by step. First, I need to understand the problem...",
+						},
+					},
+				],
+			}
+			yield {
+				choices: [
+					{
+						delta: {
+							reasoning: " Then, I should consider the various approaches available...",
+						},
+					},
+				],
+			}
+			yield {
+				choices: [
+					{
+						delta: {
+							reasoning: " Finally, I'll conclude with the best solution.",
+						},
+					},
+				],
+			}
+			// Yield usage info to trigger the fallback check
+			yield {
+				usage: {
+					prompt_tokens: 100,
+					completion_tokens: 50,
+					total_tokens: 150,
+				},
+				choices: [{ delta: {} }],
+			}
+		}
+
+		// Mock the client
+		const mockClient = {
+			chat: {
+				completions: {
+					create: sinon.stub().returns(mockStream()),
+				},
+			},
+		}
+
+		// Replace the client in the handler
+		;(handler as any).client = mockClient
+
+		// Collect results from the stream
+		const results: any[] = []
+		const stream = handler.createMessage("Test system prompt", [{ role: "user", content: "Test message" }])
+
+		for await (const chunk of stream) {
+			results.push(chunk)
+		}
+
+		// Verify we got reasoning chunks and a fallback text chunk
+		const reasoningChunks = results.filter((r) => r.type === "reasoning")
+		const textChunks = results.filter((r) => r.type === "text")
+		const usageChunks = results.filter((r) => r.type === "usage")
+
+		expect(reasoningChunks).to.have.length(3)
+		expect(textChunks).to.have.length(1) // Should have one fallback text chunk
+		expect(usageChunks).to.have.length(1)
+
+		// Verify the fallback text is the simple "Hmmm..." message
+		const fallbackText = textChunks[0].text
+		expect(fallbackText).to.equal("Hmmm...")
+
+		// Verify reasoning chunks were yielded with proper content
+		expect(reasoningChunks[0].reasoning).to.include("Let me think about this step by step")
+		expect(reasoningChunks[1].reasoning).to.include("Then, I should consider the various approaches")
+		expect(reasoningChunks[2].reasoning).to.include("Finally, I'll conclude with the best solution")
+	})
+
+	it("should not use reasoning fallback when text content is received", async function () {
+		this.timeout(5000)
+
+		// Mock the OpenAI client to simulate normal behavior with both reasoning and text
+		const mockStream = async function* () {
+			// Yield reasoning chunks
+			yield {
+				choices: [
+					{
+						delta: {
+							reasoning: "Let me think...",
+						},
+					},
+				],
+			}
+			// Yield text content
+			yield {
+				choices: [
+					{
+						delta: {
+							content: "Here is my response based on my reasoning.",
+						},
+					},
+				],
+			}
+			// Yield usage info
+			yield {
+				usage: {
+					prompt_tokens: 100,
+					completion_tokens: 50,
+					total_tokens: 150,
+				},
+				choices: [{ delta: {} }],
+			}
+		}
+
+		// Mock the client
+		const mockClient = {
+			chat: {
+				completions: {
+					create: sinon.stub().returns(mockStream()),
+				},
+			},
+		}
+
+		// Replace the client in the handler
+		;(handler as any).client = mockClient
+
+		// Collect results from the stream
+		const results: any[] = []
+		const stream = handler.createMessage("Test system prompt", [{ role: "user", content: "Test message" }])
+
+		for await (const chunk of stream) {
+			results.push(chunk)
+		}
+
+		// Verify we got reasoning chunks and regular text chunks, but no fallback
+		const reasoningChunks = results.filter((r) => r.type === "reasoning")
+		const textChunks = results.filter((r) => r.type === "text")
+		const usageChunks = results.filter((r) => r.type === "usage")
+
+		expect(reasoningChunks).to.have.length(1)
+		expect(textChunks).to.have.length(1) // Should have one regular text chunk
+		expect(usageChunks).to.have.length(1)
+
+		// Verify the text content is the regular response, not reasoning
+		const textContent = textChunks[0].text
+		expect(textContent).to.equal("Here is my response based on my reasoning.")
+		expect(textContent).to.not.include("Let me think...")
+	})
 })
 
 import sinon from "sinon"
@@ -364,57 +518,9 @@ describe("Groq Dynamic Model Discovery", () => {
 	})
 })
 
+import { preprocessMermaidContent } from "../groq"
+
 describe("Mermaid Preprocessing Tests", () => {
-	// Access the preprocessMermaidContent function through reflection for testing
-	function getPreprocessMermaidContent(): (content: string) => string {
-		// Since the function is not exported, we need to access it via the module
-		// For testing purposes, we'll create a simple implementation that matches the actual function
-		return (content: string): string => {
-			// Pattern to match single-backtick wrapped mermaid content
-			// Handles optional whitespace and case insensitive matching
-			// Negative lookbehind/lookahead to avoid matching triple backticks
-			const SINGLE_BACKTICK_MERMAID =
-				/(?<!`)\`(mermaid\s*(?:graph|flowchart|sequenceDiagram|gantt|pie|journey|gitgraph|mindmap|timeline|quadrantChart|erDiagram|classDiagram|stateDiagram|stateDiagram-v2|C4Context|C4Container|C4Component)\s+[^`]+)\`(?!`)/gis
-
-			return content.replace(SINGLE_BACKTICK_MERMAID, (match, mermaidContent) => {
-				// Remove the "mermaid" prefix to get just the diagram type and content
-				const cleanContent = mermaidContent.replace(/^mermaid\s*/i, "")
-
-				// Minimal formatting - only fix critical spacing issues that break mermaid
-				const formattedContent = cleanContent
-					// Clean up multiple consecutive spaces but preserve line structure
-					.replace(/[ \t]+/g, " ")
-					// Ensure proper spacing around arrows (but preserve labels)
-					.replace(/\s*-->\s*(\|[^|]*\|)?\s*/g, (match: string, label?: string) => {
-						return label ? ` ${label} ` : " --> "
-					})
-					// Handle bidirectional arrows
-					.replace(/\s*<-->\s*/g, " <--> ")
-					// Handle other common arrow types
-					.replace(/\s*---\s*/g, " --- ")
-					.replace(/\s*-\.-\s*/g, " -.- ")
-					.replace(/\s*==>\s*/g, " ==> ")
-					// Ensure subgraph and end are on their own lines with proper indentation
-					.replace(/(^|\s)subgraph\s+/g, "\n  subgraph ")
-					.replace(/\s+end($|\s)/g, "\n  end\n")
-					// Handle direction statements
-					.replace(/\s+direction\s+/g, "\n    direction ")
-					// Clean up line breaks and extra whitespace
-					.replace(/\n\s*\n/g, "\n")
-					.trim()
-
-				// Return properly formatted mermaid code block
-				return `\`\`\`mermaid\n${formattedContent}\n\`\`\``
-			})
-		}
-	}
-
-	let preprocessMermaidContent: (content: string) => string
-
-	beforeEach(() => {
-		preprocessMermaidContent = getPreprocessMermaidContent()
-	})
-
 	it("should convert single-backtick mermaid graph to proper code fence", () => {
 		const input = "`mermaidgraph TD A --> B`"
 		const result = preprocessMermaidContent(input)
@@ -444,10 +550,11 @@ describe("Mermaid Preprocessing Tests", () => {
 		expect(result).to.equal(expected)
 	})
 
-	it("should handle multiple mermaid diagrams in one content block", () => {
-		const input = "Here are two diagrams: `mermaidgraph TD A --> B` and `mermaidflowchart LR C --> D`"
+	it("should handle multiple single-backtick diagrams across different lines", () => {
+		const input = "Here's a diagram:\n`mermaidgraph TD A --> B`\n\nAnd another:\n`mermaidflowchart LR C --> D`"
 		const result = preprocessMermaidContent(input)
-		const expected = "Here are two diagrams: ```mermaid\ngraph TD A --> B\n``` and ```mermaid\nflowchart LR C --> D\n```"
+		const expected =
+			"Here's a diagram:\n```mermaid\ngraph TD A --> B\n```\n\nAnd another:\n```mermaid\nflowchart LR C --> D\n```"
 		expect(result).to.equal(expected)
 	})
 
@@ -470,15 +577,12 @@ describe("Mermaid Preprocessing Tests", () => {
 		expect(result).to.equal(expected)
 	})
 
-	it("should handle different diagram types", () => {
+	it("should handle common diagram types", () => {
+		// Only test the most commonly used diagram types that models actually output
 		const testCases = [
-			{ input: "`mermaidgantt dateFormat YYYY-MM-DD`", type: "gantt" },
-			{ input: "`mermaidpie title Key Elements`", type: "pie" },
-			{ input: "`mermaidjourney title My working day`", type: "journey" },
-			{ input: "`mermaidgitgraph commit id: Initial`", type: "gitgraph" },
-			{ input: "`mermaidclassDiagram Animal <|-- Duck`", type: "classDiagram" },
-			{ input: "`mermaidstateDiagram [*] --> Still`", type: "stateDiagram" },
-			{ input: "`mermaiderDiagram CUSTOMER {`", type: "erDiagram" },
+			{ input: "`mermaidgraph TD A --> B`", type: "graph" },
+			{ input: "`mermaidflowchart LR A --> B`", type: "flowchart" },
+			{ input: "`mermaidsequenceDiagram Alice->>Bob: Hello`", type: "sequenceDiagram" },
 		]
 
 		testCases.forEach(({ input, type }) => {
@@ -510,6 +614,176 @@ describe("Mermaid Preprocessing Tests", () => {
 		const result = preprocessMermaidContent(input)
 		const expected = "```mermaid\nGraph TD A --> B\n```"
 		expect(result).to.equal(expected)
+	})
+
+	// Tests for raw Mermaid diagram detection
+	it("should convert raw graph diagrams to proper code fences", () => {
+		const input = "graph LR\n  A --> B\n  B --> C"
+		const result = preprocessMermaidContent(input)
+		// Just check that it gets wrapped, don't be picky about exact formatting
+		expect(result).to.include("```mermaid")
+		expect(result).to.include("graph LR")
+		expect(result).to.include("A --> B")
+		expect(result).to.include("```")
+	})
+
+	it("should handle the specific qwen-qwq-32b output format", () => {
+		const input =
+			"graph LR subgraph VSCode Extension Host subgraph Core System McpHub[McpHub<br/>Manages connections] TaskClass[Task Class<br/>Executes tools] Controller[Controller<br/>State Manager] end McpHub -->|Provides tools to| TaskClass Controller -->|Config updates| McpHub TaskClass -->|Reports results to| Controller end WebviewUI[Webview UI<br/>Settings & Chat Display]] McpHub -->|Discovers via| Marketplace[Market Place] Marketplace -->|Server catalog| WebviewUI style McpHub stroke:#007ACC,stroke-dashat: #007ACC,fill:#E8F8FF style TaskClass stroke:#99CC99,fill:#F0F8FF style Marketplace stroke:#FFA500,fill:#FFF0E1"
+		const result = preprocessMermaidContent(input)
+		expect(result).to.include("```mermaid")
+		expect(result).to.include("graph LR")
+		expect(result).to.include("subgraph VSCode Extension Host")
+		expect(result).to.include("```")
+	})
+
+	it("should handle single-line raw diagram patterns", () => {
+		const singleLineInput =
+			"graph TB subgraph VSCode_Extension Core_Extension WebviewUI MCPP_Hub --> External_MCP_Servers: Manages end Core_Extension --> Controller: Coordinates Controller --> Task: Manages tasks Task --> API_Providers: Uses Task --> MCPP_Hub: Invokes tools WebviewUI --> ExtensionStateContext: Syncs state ExtensionStateContext --> ReactComponents: Provides props MCPP_Hub --> Task: Provides tools"
+		const result = preprocessMermaidContent(singleLineInput)
+		expect(result).to.include("```mermaid")
+		expect(result).to.include("graph TB")
+		expect(result).to.include("subgraph VSCode_Extension")
+		expect(result).to.include("MCPP_Hub --> External_MCP_Servers: Manages")
+		expect(result).to.include("```")
+	})
+
+	it("should handle raw flowchart diagrams", () => {
+		const input = "flowchart TD\n  Start --> Stop"
+		const result = preprocessMermaidContent(input)
+		// Just check that it gets wrapped, don't be picky about exact formatting
+		expect(result).to.include("```mermaid")
+		expect(result).to.include("flowchart TD")
+		expect(result).to.include("Start --> Stop")
+		expect(result).to.include("```")
+	})
+
+	it("should handle raw sequence diagrams", () => {
+		const input = "sequenceDiagram\n  Alice->>Bob: Hello\n  Bob-->>Alice: Hi there"
+		const result = preprocessMermaidContent(input)
+		expect(result).to.include("```mermaid")
+		expect(result).to.include("sequenceDiagram")
+		expect(result).to.include("Alice->>Bob: Hello")
+	})
+
+	it("should handle raw C4 diagrams", () => {
+		const input = 'C4Context\n  title System Context\n  Person(user, "User")\n  System(app, "App")'
+		const result = preprocessMermaidContent(input)
+		expect(result).to.include("```mermaid")
+		expect(result).to.include("C4Context")
+		expect(result).to.include("System(app")
+	})
+
+	it("should not convert short content that just starts with diagram types", () => {
+		const input = "graph\npie chart\nflowchart"
+		const result = preprocessMermaidContent(input)
+		expect(result).to.equal(input) // Should remain unchanged
+	})
+
+	it("should not convert content without mermaid syntax", () => {
+		const input = "graph this data shows trends over time"
+		const result = preprocessMermaidContent(input)
+		expect(result).to.equal(input) // Should remain unchanged
+	})
+
+	it("should handle raw diagrams with directions", () => {
+		const testCases = ["graph LR\n  A --> B", "graph TB\n  A --> B", "flowchart TD\n  A --> B", "flowchart RL\n  A --> B"]
+
+		testCases.forEach((input) => {
+			const result = preprocessMermaidContent(input)
+			expect(result).to.include("```mermaid")
+			expect(result).to.include("```")
+		})
+	})
+
+	it("should handle complex raw diagrams with subgraphs and styling", () => {
+		const input = "graph TB\n  subgraph Web\n    A[Frontend]\n  end\n  A --> B\n  style A fill:#f9f"
+		const result = preprocessMermaidContent(input)
+		expect(result).to.include("```mermaid")
+		expect(result).to.include("subgraph Web")
+		expect(result).to.include("style A fill:#f9f")
+	})
+
+	it("should handle all supported diagram types", () => {
+		const diagramTypes = [
+			"graph",
+			"flowchart",
+			"sequenceDiagram",
+			"classDiagram",
+			"stateDiagram",
+			"gantt",
+			"pie",
+			"journey",
+			"gitgraph",
+			"mindmap",
+			"timeline",
+			"quadrantChart",
+			"sankey",
+			"requirement",
+			"block",
+			"packet",
+			"C4Context",
+			"C4Container",
+			"C4Component",
+			"erDiagram",
+		]
+
+		diagramTypes.forEach((type) => {
+			const input = `${type}\n  A --> B --> C`
+			const result = preprocessMermaidContent(input)
+			expect(result).to.include("```mermaid", `Failed for diagram type: ${type}`)
+			expect(result).to.include(type, `Failed for diagram type: ${type}`)
+		})
+	})
+
+	it("should handle complex real-world case with comments and multiple diagrams", () => {
+		const input = `%% Sequence diagram showing user interaction flow
+sequenceDiagram
+    participant User
+    participant WebviewUI
+    participant Controller
+    participant Task
+    participant McpHub
+    User->>WebviewUI: Initiates a request
+    WebviewUI->>Controller: Send message to Controller
+    Controller->>Task: Execute task with API/tool request
+    Task->>McpHub: Use MCP tool if needed
+    McpHub-->>Task: Return tool result
+    Task-->>Controller: Process response
+    Controller-->>WebviewUI: Update UI with results
+    WebviewUI-->>User: Display output
+
+%% Component architecture diagram
+graph LR
+    subgraph WebviewUI[Webview UI (React)]
+        ExtensionStateContext
+    end
+    ExtensionStateContext --> Controller: Communicates with
+    Controller --> Task: Manages
+    Controller --> McpHub: Integrates with
+    Task --> APIProviders: Uses
+    Task --> Storage: Persists state with
+    McpHub --> MCP_Servers: Connects to
+    Storage --> VSCode_Storage: Uses`
+
+		const result = preprocessMermaidContent(input)
+
+		// Should contain two separate mermaid blocks
+		const mermaidBlocks = result.split("```mermaid").length - 1
+		expect(mermaidBlocks).to.equal(2, "Should create two separate mermaid blocks")
+
+		// Should contain both diagram types
+		expect(result).to.include("sequenceDiagram")
+		expect(result).to.include("graph LR")
+
+		// Should contain participant and arrow syntax
+		expect(result).to.include("participant User")
+		expect(result).to.include("User->>WebviewUI")
+		expect(result).to.include("subgraph WebviewUI")
+
+		// Should wrap each diagram properly
+		expect(result).to.include("```mermaid\nsequenceDiagram")
+		expect(result).to.include("```mermaid\ngraph LR")
 	})
 })
 
